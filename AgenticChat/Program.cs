@@ -4,6 +4,7 @@ using AgenticChat.Services;
 var memoryFilePath = Environment.GetEnvironmentVariable("MEMORY_FILE_PATH") ?? "memory.json";
 
 var memoryService = new MemoryService(memoryFilePath);
-var agent = new AgentChat(memoryService);
+var sessionManager = new SessionManager();
+var agent = new AgentChat(memoryService, sessionManager);
 
 await agent.RunAsync();

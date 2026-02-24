@@ -47,11 +47,16 @@ dotnet run
 
 ### 3. Chat commands
 
-| Command   | Description                              |
-|-----------|------------------------------------------|
-| `memory`  | Display all stored long-term memories    |
-| `history` | Show the current short-term chat history |
-| `exit`    | Quit (memories are persisted to disk)    |
+| Command              | Description                                                              |
+|----------------------|--------------------------------------------------------------------------|
+| `memory`             | Display all stored long-term memories                                    |
+| `history`            | Show the current short-term chat history                                 |
+| `context`            | Tree / tabular view of everything the agent can currently see            |
+| `sessions`           | List all active sessions with turn/message counts                        |
+| `new <name>`         | Create a new named session and switch to it                              |
+| `switch <name|#>`  | Switch to a session by name or 1-based index                             |
+| `focus <topic>`      | Direct the agent's attention to a topic on the next turn                 |
+| `exit`               | Quit (memories are persisted to disk)                                    |
 
 ---
 
@@ -60,13 +65,16 @@ dotnet run
 ```
 Program.cs
  └─ AgentChat (Services/AgentChat.cs)
-     ├─ MemoryService (Services/MemoryService.cs)   ← JSON-backed long-term store
-     ├─ Short-term history []                        ← sliding window (20 msgs)
-     ├─ System prompt builder                        ← injects memories on every turn
-     ├─ Tool: add_memory(key, content)               ← persist a memory
-     ├─ Tool: search_memory(query)                   ← search memories (semantic-lite)
-     ├─ Tool: get_all_memories()                     ← load all memories (used at startup)
-     └─ Agentic loop                                 ← handles multi-step tool calls
+     ├─ SessionManager (Services/SessionManager.cs)   ← multi-session management
+     │   └─ ChatSession[] (Models/ChatSession.cs)     ← per-session history + metadata
+     ├─ MemoryService (Services/MemoryService.cs)     ← JSON-backed long-term store
+     ├─ System prompt builder                          ← injects memories on every turn
+     ├─ Tool: add_memory(key, content)                 ← persist a memory
+     ├─ Tool: search_memory(query)                     ← search memories (semantic-lite)
+     ├─ Tool: get_all_memories()                       ← load all memories (used at startup)
+     ├─ Context tree viewer                            ← tree/tabular pane of agent context
+     ├─ Focus mode                                     ← directs agent attention to a topic
+     └─ Agentic loop                                   ← handles multi-step tool calls
 ```
 
 ### How the agentic loop works

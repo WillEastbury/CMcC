@@ -11,24 +11,32 @@ namespace AgenticChat.Services;
 /// <summary>
 /// Agentic chat service that combines:
 /// <list type="bullet">
-///   <item>Short-term conversational history (sliding window)</item>
+///   <item>Multi-session management (create, list, switch named sessions)</item>
+///   <item>Short-term conversational history (sliding window, per session)</item>
 ///   <item>Long-term memory tools that persist information across sessions</item>
 ///   <item>Memory injected into every system prompt (RAG-style)</item>
 ///   <item>A startup context-loading sequence that fires tool calls before the
 ///         first user message</item>
+///   <item>Context viewer showing a tree/tabular snapshot of what the agent sees</item>
+///   <item>Focus mode that directs agent attention to a specific memory topic</item>
 /// </list>
 /// </summary>
 public class AgentChat
 {
     // ── Constants ──────────────────────────────────────────────────────────────
     private const int MaxShortTermMessages = 20;
+    private const int HistoryPreviewLength = 72;
 
     // ── Dependencies ───────────────────────────────────────────────────────────
     private readonly MemoryService _memoryService;
+    private readonly SessionManager _sessionManager;
     private readonly ChatClient _chatClient;
 
-    // ── Short-term history (user + assistant pairs only) ───────────────────────
-    private readonly List<ChatMessage> _history = [];
+    // ── Short-term history (delegates to the active session) ───────────────────
+    private List<ChatMessage> History => _sessionManager.Active.History;
+
+    // ── Pending focus directive (injected into the next user turn) ─────────────
+    private string? _pendingFocus;
 
     // ── Tool definitions ───────────────────────────────────────────────────────
 
@@ -93,9 +101,10 @@ public class AgentChat
 
     // ── Construction ───────────────────────────────────────────────────────────
 
-    public AgentChat(MemoryService memoryService)
+    public AgentChat(MemoryService memoryService, SessionManager sessionManager)
     {
         _memoryService = memoryService;
+        _sessionManager = sessionManager;
         _chatClient = BuildChatClient();
     }
 
@@ -221,14 +230,15 @@ public class AgentChat
 
     private void AddToHistory(ChatMessage message)
     {
-        _history.Add(message);
+        History.Add(message);
         // Trim to keep the sliding window within bounds
-        while (_history.Count > MaxShortTermMessages)
-            _history.RemoveAt(0);
+        while (History.Count > MaxShortTermMessages)
+            History.RemoveAt(0);
+        _sessionManager.Active.LastActiveAt = DateTime.UtcNow;
     }
 
     private List<ChatMessage> BuildMessages() =>
-        [new SystemChatMessage(BuildSystemPrompt()), .. _history];
+        [new SystemChatMessage(BuildSystemPrompt()), .. History];
 
     // ── Startup context-loading (RAG-like injection) ───────────────────────────
 
@@ -271,7 +281,15 @@ public class AgentChat
 
     private async Task<string> ChatAsync(string userMessage)
     {
+        // Prepend any pending focus directive
+        if (_pendingFocus is not null)
+        {
+            userMessage = $"[Focus context: {_pendingFocus}]\n\n{userMessage}";
+            _pendingFocus = null;
+        }
+
         AddToHistory(new UserChatMessage(userMessage));
+        _sessionManager.Active.TurnCount++;
 
         var messages = BuildMessages();
         var reply = await RunAgentLoopAsync(messages);
@@ -292,14 +310,24 @@ public class AgentChat
         // ── Main REPL loop ──────────────────────────────────────────────────────
         while (true)
         {
+            var session = _sessionManager.Active;
+
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.Write("You: ");
+            Console.Write($"[{session.Name}] You");
+            if (_pendingFocus is not null)
+            {
+                Console.ForegroundColor = ConsoleColor.Magenta;
+                Console.Write($" (focus: {_pendingFocus})");
+            }
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.Write(": ");
             Console.ResetColor();
 
             var input = Console.ReadLine()?.Trim();
 
             if (string.IsNullOrEmpty(input)) continue;
 
+            // ── exit ───────────────────────────────────────────────────────────
             if (input.Equals("quit", StringComparison.OrdinalIgnoreCase) ||
                 input.Equals("exit", StringComparison.OrdinalIgnoreCase))
             {
@@ -307,6 +335,7 @@ public class AgentChat
                 break;
             }
 
+            // ── memory ─────────────────────────────────────────────────────────
             if (input.Equals("memory", StringComparison.OrdinalIgnoreCase))
             {
                 Console.ForegroundColor = ConsoleColor.Cyan;
@@ -317,14 +346,88 @@ public class AgentChat
                 continue;
             }
 
+            // ── history ────────────────────────────────────────────────────────
             if (input.Equals("history", StringComparison.OrdinalIgnoreCase))
             {
                 Console.ForegroundColor = ConsoleColor.Cyan;
-                Console.WriteLine($"── Short-Term History ({_history.Count}/{MaxShortTermMessages} messages) ──");
-                foreach (var msg in _history)
+                Console.WriteLine($"── Short-Term History ({History.Count}/{MaxShortTermMessages} messages) ──");
+                foreach (var msg in History)
                     Console.WriteLine($"  [{msg.GetType().Name.Replace("ChatMessage", "")}] {GetMessageText(msg)}");
                 Console.WriteLine("─────────────────────────────────────────────────────────────");
                 Console.ResetColor();
+                continue;
+            }
+
+            // ── sessions ───────────────────────────────────────────────────────
+            if (input.Equals("sessions", StringComparison.OrdinalIgnoreCase))
+            {
+                PrintSessionsTable();
+                continue;
+            }
+
+            // ── new <name> ─────────────────────────────────────────────────────
+            if (input.StartsWith("new ", StringComparison.OrdinalIgnoreCase))
+            {
+                var newName = input[4..].Trim();
+                if (string.IsNullOrEmpty(newName))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("Usage: new <session-name>");
+                    Console.ResetColor();
+                }
+                else
+                {
+                    var newSession = _sessionManager.CreateSession(newName);
+                    Console.ForegroundColor = ConsoleColor.Cyan;
+                    Console.WriteLine($"Created and switched to session '{newSession.Name}' [{newSession.Id}].");
+                    Console.ResetColor();
+                    await InitializeSessionAsync();
+                }
+                continue;
+            }
+
+            // ── switch <name|#> ────────────────────────────────────────────────
+            if (input.StartsWith("switch ", StringComparison.OrdinalIgnoreCase))
+            {
+                var target = input[7..].Trim();
+                var switched = _sessionManager.SwitchTo(target);
+                Console.ForegroundColor = switched is not null ? ConsoleColor.Cyan : ConsoleColor.Red;
+                Console.WriteLine(switched is not null
+                    ? $"Switched to session '{switched.Name}' [{switched.Id}]  (turn {switched.TurnCount}, {switched.History.Count} messages)."
+                    : $"Session '{target}' not found. Use 'sessions' to list available sessions.");
+                Console.ResetColor();
+                continue;
+            }
+
+            // ── context ────────────────────────────────────────────────────────
+            if (input.Equals("context", StringComparison.OrdinalIgnoreCase))
+            {
+                PrintContextTree();
+                continue;
+            }
+
+            // ── focus <topic> ──────────────────────────────────────────────────
+            if (input.StartsWith("focus ", StringComparison.OrdinalIgnoreCase))
+            {
+                var topic = input[6..].Trim();
+                if (string.IsNullOrEmpty(topic))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("Usage: focus <topic>  – directs the agent to pay attention to that topic on the next turn.");
+                    Console.ResetColor();
+                }
+                else
+                {
+                    _pendingFocus = topic;
+                    var matches = _memoryService.SearchMemories(topic).ToList();
+                    Console.ForegroundColor = ConsoleColor.Magenta;
+                    Console.WriteLine($"Focus set to '{topic}'. Relevant memories ({matches.Count}):");
+                    foreach (var m in matches)
+                        Console.WriteLine($"  ├─ [{m.Key}]: {m.Content}");
+                    if (matches.Count == 0)
+                        Console.WriteLine("  └─ (none – the agent will still be directed to focus on this topic)");
+                    Console.ResetColor();
+                }
                 continue;
             }
 
@@ -332,7 +435,7 @@ public class AgentChat
             {
                 var reply = await ChatAsync(input);
                 Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.Write("Assistant: ");
+                Console.Write($"[{_sessionManager.Active.Name}] Assistant: ");
                 Console.ResetColor();
                 Console.WriteLine(reply);
                 Console.WriteLine();
@@ -351,16 +454,130 @@ public class AgentChat
     private static void PrintBanner()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("╔═══════════════════════════════════════════╗");
-        Console.WriteLine("║         Agentic Chat App  (CMcC)          ║");
-        Console.WriteLine("╠═══════════════════════════════════════════╣");
-        Console.WriteLine("║  Commands:                                ║");
-        Console.WriteLine("║    memory   – show stored memories        ║");
-        Console.WriteLine("║    history  – show short-term history     ║");
-        Console.WriteLine("║    exit     – quit                        ║");
-        Console.WriteLine("╚═══════════════════════════════════════════╝");
+        Console.WriteLine("╔══════════════════════════════════════════════════╗");
+        Console.WriteLine("║          Agentic Chat App  (CMcC)                ║");
+        Console.WriteLine("╠══════════════════════════════════════════════════╣");
+        Console.WriteLine("║  Commands:                                       ║");
+        Console.WriteLine("║    memory            – show stored memories      ║");
+        Console.WriteLine("║    history           – show short-term history   ║");
+        Console.WriteLine("║    context           – context tree / data pane  ║");
+        Console.WriteLine("║    sessions          – list all sessions         ║");
+        Console.WriteLine("║    new <name>        – create a new session      ║");
+        Console.WriteLine("║    switch <name|#>   – switch active session     ║");
+        Console.WriteLine("║    focus <topic>     – direct agent attention    ║");
+        Console.WriteLine("║    exit              – quit                      ║");
+        Console.WriteLine("╚══════════════════════════════════════════════════╝");
         Console.ResetColor();
         Console.WriteLine();
+    }
+
+    /// <summary>
+    /// Prints a tabular list of all sessions, highlighting the active one.
+    /// </summary>
+    private void PrintSessionsTable()
+    {
+        var sessions = _sessionManager.Sessions;
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("── Sessions ─────────────────────────────────────────────────────────");
+        Console.WriteLine($"  {"#",-4} {"Name",-20} {"Created",-21} {"Turns",-6} {"Msgs",-5} {"Status"}");
+        Console.WriteLine($"  {"─",-4} {"─────────────────────",-20} {"───────────────────",-21} {"─────",-6} {"────",-5} ──────────");
+        for (int i = 0; i < sessions.Count; i++)
+        {
+            var s = sessions[i];
+            bool isActive = s == _sessionManager.Active;
+            Console.ForegroundColor = isActive ? ConsoleColor.White : ConsoleColor.Cyan;
+            Console.WriteLine(
+                $"  {i + 1,-4} {s.Name,-20} {s.CreatedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}  {s.TurnCount,-6} {s.History.Count,-5} {(isActive ? "← active" : "")}");
+        }
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("─────────────────────────────────────────────────────────────────────");
+        Console.ResetColor();
+    }
+
+    /// <summary>
+    /// Prints a tree-style snapshot of everything the agent can currently see:
+    /// the active session info, long-term memories, and short-term history.
+    /// </summary>
+    private void PrintContextTree()
+    {
+        var session = _sessionManager.Active;
+        var memories = _memoryService.GetAllMemories().ToList();
+
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("═══════════════════════════════════════════════════════════════════");
+        Console.WriteLine($"  CONTEXT SNAPSHOT  │  Session: {session.Name} [{session.Id}]  │  Turn: {session.TurnCount}");
+        Console.WriteLine("═══════════════════════════════════════════════════════════════════");
+        Console.WriteLine();
+
+        // ── Long-term memory tree ──────────────────────────────────────────────
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine($"  📦  Long-Term Memory  ({memories.Count} {(memories.Count == 1 ? "entry" : "entries")})");
+        if (memories.Count == 0)
+        {
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine("      └─ (no memories stored yet)");
+        }
+        else
+        {
+            for (int i = 0; i < memories.Count; i++)
+            {
+                var m = memories[i];
+                bool last = i == memories.Count - 1;
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.Write($"  {(last ? "└─" : "├─")} ");
+                Console.ForegroundColor = ConsoleColor.White;
+                Console.Write($"[{m.Key}]");
+                Console.ForegroundColor = ConsoleColor.Gray;
+                Console.WriteLine($"  {m.Content}");
+            }
+        }
+
+        Console.WriteLine();
+
+        // ── Short-term history tree ────────────────────────────────────────────
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine($"  💬  Conversation History  ({History.Count} / {MaxShortTermMessages} messages)");
+        if (History.Count == 0)
+        {
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine("      └─ (no messages yet)");
+        }
+        else
+        {
+            for (int i = 0; i < History.Count; i++)
+            {
+                var msg = History[i];
+                bool last = i == History.Count - 1;
+                var role = msg switch
+                {
+                    UserChatMessage => "User     ",
+                    AssistantChatMessage => "Assistant",
+                    _ => "Other    ",
+                };
+                var text = GetMessageText(msg);
+                var preview = text.Length > HistoryPreviewLength ? text[..HistoryPreviewLength] + "…" : text;
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.Write($"  {(last ? "└─" : "├─")} ");
+                Console.ForegroundColor = msg is UserChatMessage ? ConsoleColor.Green : ConsoleColor.White;
+                Console.Write($"[{role}]");
+                Console.ForegroundColor = ConsoleColor.Gray;
+                Console.WriteLine($"  {preview}");
+            }
+        }
+
+        Console.WriteLine();
+
+        // ── Pending focus ──────────────────────────────────────────────────────
+        if (_pendingFocus is not null)
+        {
+            Console.ForegroundColor = ConsoleColor.Magenta;
+            Console.WriteLine($"  🎯  Pending Focus: {_pendingFocus}");
+            Console.WriteLine();
+        }
+
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("═══════════════════════════════════════════════════════════════════");
+        Console.ResetColor();
     }
 
     private static void PrintToolCall(string name, string args)
