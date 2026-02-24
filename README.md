@@ -76,7 +76,7 @@ Program.cs
 3. The model responds; if it requests tool calls they are executed and fed back into the messages list. Step 3 repeats until the model emits a final text response.
 4. The assistant reply is appended to history and printed.
 
-### Startup sequence (RAG-like injection)
+### Startup sequence (RAG-like injection and MCP Calls
 
 On launch, before the first user message, the agent:
 1. Sends a startup prompt instructing the model to call `get_all_memories`.
@@ -91,8 +91,6 @@ An example of creating an interactive agent that can consume / ground in multipl
 The agent should simply have some grounding from an API before the chat context even starts - this makes the need for that data and the prompt to be hyper-tuned and the framework here should show that. 
 
 LLM API -> Context starts by generating parameters for the query. 
-Our example will be a horse racing prediction engine based on the BetFair apis for odds and results data.
-We will need to determine the day, any races, and the racecard data from BetFair, current and predicted changes in weather at those locations that may effect the going of the ground.
+There are thousands of possible use cases for this - sports analysis, holiday booking, agentic commerce, documentation searches and context. WorkIQ etc. 
 
-Then we should attribute prices to each horse without considering the current odds and look for undervalued picks based on a set of rules in the prompt.
    
