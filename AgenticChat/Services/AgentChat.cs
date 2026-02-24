@@ -1,9 +1,7 @@
-using System.ClientModel;
+using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
-using Azure;
-using Azure.AI.OpenAI;
-using OpenAI;
-using OpenAI.Chat;
+using System.Text.Json.Nodes;
 using AgenticChat.Models;
 
 namespace AgenticChat.Services;
@@ -25,81 +23,83 @@ public class AgentChat
 
     // ── Dependencies ───────────────────────────────────────────────────────────
     private readonly MemoryService _memoryService;
-    private readonly ChatClient _chatClient;
+
+    // Shared HttpClient – reused for all requests to avoid socket exhaustion.
+    private static readonly HttpClient s_http = new();
+    private readonly string _apiUrl;
+    private readonly string _model;
 
     // ── Short-term history (user + assistant pairs only) ───────────────────────
-    private readonly List<ChatMessage> _history = [];
+    private readonly List<JsonObject> _history = [];
 
     // ── Tool definitions ───────────────────────────────────────────────────────
 
-    private static readonly ChatTool s_addMemoryTool = ChatTool.CreateFunctionTool(
-        functionName: "add_memory",
-        functionDescription:
-            "Add or update a long-term memory entry so it is available in future sessions. " +
-            "Use this whenever the user shares something important to remember " +
-            "(name, preferences, projects, goals, etc.).",
-        functionParameters: BinaryData.FromString("""
-        {
-            "type": "object",
-            "properties": {
-                "key": {
+    private static readonly JsonArray s_tools = JsonNode.Parse("""
+        [
+          {
+            "type": "function",
+            "function": {
+              "name": "add_memory",
+              "description": "Add or update a long-term memory entry so it is available in future sessions. Use this whenever the user shares something important to remember (name, preferences, projects, goals, etc.).",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "key": {
                     "type": "string",
                     "description": "Short identifier for the memory, e.g. 'user_name', 'preferred_language', 'current_project'."
-                },
-                "content": {
+                  },
+                  "content": {
                     "type": "string",
                     "description": "The information to store."
-                }
-            },
-            "required": ["key", "content"],
-            "additionalProperties": false
-        }
-        """));
-
-    private static readonly ChatTool s_searchMemoryTool = ChatTool.CreateFunctionTool(
-        functionName: "search_memory",
-        functionDescription:
-            "Search stored long-term memories for a given query. " +
-            "Useful when you need to recall specific information about the user.",
-        functionParameters: BinaryData.FromString("""
-        {
-            "type": "object",
-            "properties": {
-                "query": {
+                  }
+                },
+                "required": ["key", "content"],
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "search_memory",
+              "description": "Search stored long-term memories for a given query. Useful when you need to recall specific information about the user.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "query": {
                     "type": "string",
                     "description": "Keyword or phrase to search for in stored memories."
-                }
-            },
-            "required": ["query"],
-            "additionalProperties": false
-        }
-        """));
-
-    private static readonly ChatTool s_getAllMemoriesTool = ChatTool.CreateFunctionTool(
-        functionName: "get_all_memories",
-        functionDescription:
-            "Retrieve every stored long-term memory entry. " +
-            "Call this at the start of a session to load full context.",
-        functionParameters: BinaryData.FromString("""
-        {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-        }
-        """));
-
-    private static readonly IReadOnlyList<ChatTool> s_tools =
-        [s_addMemoryTool, s_searchMemoryTool, s_getAllMemoriesTool];
+                  }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "get_all_memories",
+              "description": "Retrieve every stored long-term memory entry. Call this at the start of a session to load full context.",
+              "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+              }
+            }
+          }
+        ]
+        """)!.AsArray();
 
     // ── Construction ───────────────────────────────────────────────────────────
 
     public AgentChat(MemoryService memoryService)
     {
         _memoryService = memoryService;
-        _chatClient = BuildChatClient();
+        (_apiUrl, _model) = ConfigureHttpClient();
     }
 
-    private static ChatClient BuildChatClient()
+    private static (string, string) ConfigureHttpClient()
     {
         var azureEndpoint = Environment.GetEnvironmentVariable("AZURE_OPENAI_ENDPOINT");
         var azureKey = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_KEY");
@@ -108,10 +108,10 @@ public class AgentChat
         // 1. Azure OpenAI
         if (!string.IsNullOrWhiteSpace(azureEndpoint) && !string.IsNullOrWhiteSpace(azureKey))
         {
-            var azureClient = new AzureOpenAIClient(
-                new Uri(azureEndpoint),
-                new AzureKeyCredential(azureKey));
-            return azureClient.GetChatClient(azureDeployment);
+            s_http.DefaultRequestHeaders.Remove("api-key");
+            s_http.DefaultRequestHeaders.Add("api-key", azureKey);
+            var url = $"{azureEndpoint.TrimEnd('/')}/openai/deployments/{azureDeployment}/chat/completions?api-version=2024-10-21";
+            return (url, azureDeployment);
         }
 
         var openAiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
@@ -120,21 +120,22 @@ public class AgentChat
 
         // 2. Any OpenAI-compatible endpoint (Ollama, llama.cpp, LM Studio, remote proxies…)
         //    OPENAI_API_KEY is optional for local servers that don't validate the key.
-        //    ApiKeyCredential requires a non-empty value, so we fall back to "none".
         //    If your server validates the key, set OPENAI_API_KEY to the expected value.
         if (!string.IsNullOrWhiteSpace(openAiBaseUrl))
         {
             var apiKey = !string.IsNullOrWhiteSpace(openAiKey) ? openAiKey : "none";
-            var options = new OpenAIClientOptions { Endpoint = new Uri(openAiBaseUrl) };
-            var client = new OpenAIClient(new ApiKeyCredential(apiKey), options);
-            return client.GetChatClient(openAiModel);
+            s_http.DefaultRequestHeaders.Authorization =
+                new AuthenticationHeaderValue("Bearer", apiKey);
+            var url = $"{openAiBaseUrl.TrimEnd('/')}/chat/completions";
+            return (url, openAiModel);
         }
 
         // 3. Standard OpenAI
         if (!string.IsNullOrWhiteSpace(openAiKey))
         {
-            var openAiClient = new OpenAIClient(new ApiKeyCredential(openAiKey));
-            return openAiClient.GetChatClient(openAiModel);
+            s_http.DefaultRequestHeaders.Authorization =
+                new AuthenticationHeaderValue("Bearer", openAiKey);
+            return ("https://api.openai.com/v1/chat/completions", openAiModel);
         }
 
         throw new InvalidOperationException(
@@ -200,46 +201,83 @@ public class AgentChat
             : string.Join("\n", list.Select(m => $"[{m.Key}]: {m.Content}"));
     }
 
+    // ── Raw API call ───────────────────────────────────────────────────────────
+
+    private async Task<JsonObject> PostChatCompletionAsync(List<JsonObject> messages)
+    {
+        var requestBody = new JsonObject
+        {
+            ["model"] = _model,
+            ["messages"] = new JsonArray(messages.Select(m => (JsonNode)m.DeepClone()).ToArray()),
+            ["tools"] = s_tools.DeepClone(),
+            ["tool_choice"] = "auto",
+        };
+
+        var body = new StringContent(requestBody.ToJsonString(), Encoding.UTF8, "application/json");
+        var response = await s_http.PostAsync(_apiUrl, body);
+        response.EnsureSuccessStatusCode();
+
+        await using var stream = await response.Content.ReadAsStreamAsync();
+        return (await JsonNode.ParseAsync(stream))!.AsObject();
+    }
+
     // ── Agentic tool-call loop ─────────────────────────────────────────────────
 
     /// <summary>
     /// Runs the model against <paramref name="messages"/>, automatically
     /// executing any tool calls until the model produces a final text response.
     /// </summary>
-    private async Task<string> RunAgentLoopAsync(List<ChatMessage> messages)
+    private async Task<string> RunAgentLoopAsync(List<JsonObject> messages)
     {
-        var options = new ChatCompletionOptions();
-        foreach (var tool in s_tools) options.Tools.Add(tool);
-
         while (true)
         {
-            var response = await _chatClient.CompleteChatAsync(messages, options);
-            var completion = response.Value;
+            var response = await PostChatCompletionAsync(messages);
+            var choice = response["choices"]![0]!;
+            var finishReason = choice["finish_reason"]?.GetValue<string>();
+            var message = choice["message"]!.AsObject();
 
-            if (completion.FinishReason == ChatFinishReason.ToolCalls)
+            if (finishReason == "tool_calls")
             {
                 // Record the assistant message (with embedded tool calls)
-                messages.Add(new AssistantChatMessage(completion));
+                messages.Add(message.DeepClone().AsObject());
 
-                foreach (var toolCall in completion.ToolCalls)
+                foreach (var toolCallNode in message["tool_calls"]!.AsArray())
                 {
-                    PrintToolCall(toolCall.FunctionName, toolCall.FunctionArguments.ToString());
-                    var result = ExecuteTool(
-                        toolCall.FunctionName,
-                        toolCall.FunctionArguments.ToString());
-                    messages.Add(new ToolChatMessage(toolCall.Id, result));
+                    var toolCall = toolCallNode!.AsObject();
+                    var id = toolCall["id"]!.GetValue<string>();
+                    var functionName = toolCall["function"]!["name"]!.GetValue<string>();
+                    var functionArgs = toolCall["function"]!["arguments"]!.GetValue<string>();
+
+                    PrintToolCall(functionName, functionArgs);
+                    var result = ExecuteTool(functionName, functionArgs);
+
+                    messages.Add(new JsonObject
+                    {
+                        ["role"] = "tool",
+                        ["tool_call_id"] = id,
+                        ["content"] = result,
+                    });
                 }
             }
             else
             {
-                return completion.Content.Count > 0 ? completion.Content[0].Text : string.Empty;
+                return message["content"]?.GetValue<string>() ?? string.Empty;
             }
         }
     }
 
     // ── Short-term history helpers ─────────────────────────────────────────────
 
-    private void AddToHistory(ChatMessage message)
+    private static JsonObject SystemMessage(string content) =>
+        new() { ["role"] = "system", ["content"] = content };
+
+    private static JsonObject UserMessage(string content) =>
+        new() { ["role"] = "user", ["content"] = content };
+
+    private static JsonObject AssistantMessage(string content) =>
+        new() { ["role"] = "assistant", ["content"] = content };
+
+    private void AddToHistory(JsonObject message)
     {
         _history.Add(message);
         // Trim to keep the sliding window within bounds
@@ -247,8 +285,8 @@ public class AgentChat
             _history.RemoveAt(0);
     }
 
-    private List<ChatMessage> BuildMessages() =>
-        [new SystemChatMessage(BuildSystemPrompt()), .. _history];
+    private List<JsonObject> BuildMessages() =>
+        [SystemMessage(BuildSystemPrompt()), .. _history];
 
     // ── Startup context-loading (RAG-like injection) ───────────────────────────
 
@@ -263,10 +301,10 @@ public class AgentChat
         Console.WriteLine("[Loading session context from long-term memory…]");
         Console.ResetColor();
 
-        var initMessages = new List<ChatMessage>
+        var initMessages = new List<JsonObject>
         {
-            new SystemChatMessage(BuildSystemPrompt()),
-            new UserChatMessage(
+            SystemMessage(BuildSystemPrompt()),
+            UserMessage(
                 "Before we begin, call get_all_memories to review everything you know " +
                 "about me, then give a short, friendly greeting that shows you remember " +
                 "relevant context. If no memories exist, just say hello."),
@@ -277,7 +315,7 @@ public class AgentChat
         if (!string.IsNullOrWhiteSpace(greeting))
         {
             // Inject greeting into short-term history so subsequent turns see it
-            AddToHistory(new AssistantChatMessage(greeting));
+            AddToHistory(AssistantMessage(greeting));
 
             Console.ForegroundColor = ConsoleColor.Yellow;
             Console.Write("Assistant: ");
@@ -291,12 +329,12 @@ public class AgentChat
 
     private async Task<string> ChatAsync(string userMessage)
     {
-        AddToHistory(new UserChatMessage(userMessage));
+        AddToHistory(UserMessage(userMessage));
 
         var messages = BuildMessages();
         var reply = await RunAgentLoopAsync(messages);
 
-        AddToHistory(new AssistantChatMessage(reply));
+        AddToHistory(AssistantMessage(reply));
         return reply;
     }
 
@@ -342,7 +380,7 @@ public class AgentChat
                 Console.ForegroundColor = ConsoleColor.Cyan;
                 Console.WriteLine($"── Short-Term History ({_history.Count}/{MaxShortTermMessages} messages) ──");
                 foreach (var msg in _history)
-                    Console.WriteLine($"  [{msg.GetType().Name.Replace("ChatMessage", "")}] {GetMessageText(msg)}");
+                    Console.WriteLine($"  [{msg["role"]?.GetValue<string>() ?? "?"}] {GetMessageText(msg)}");
                 Console.WriteLine("─────────────────────────────────────────────────────────────");
                 Console.ResetColor();
                 continue;
@@ -390,10 +428,9 @@ public class AgentChat
         Console.ResetColor();
     }
 
-    private static string GetMessageText(ChatMessage msg) => msg switch
+    private static string GetMessageText(JsonObject msg)
     {
-        UserChatMessage u => u.Content.FirstOrDefault()?.Text ?? "(empty)",
-        AssistantChatMessage a => a.Content.FirstOrDefault()?.Text ?? "(tool calls)",
-        _ => "(other)",
-    };
+        var content = msg["content"];
+        return content?.GetValue<string>() ?? "(tool calls)";
+    }
 }
