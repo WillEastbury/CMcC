@@ -9,3 +9,4 @@ Our example will be a horse racing prediction engine based on the BetFair apis f
 We will need to determine the day, any races, and the racecard data from BetFair, current and predicted changes in weather at those locations that may effect the going of the ground.
 
 Then we should attribute prices to each horse without considering the current odds and look for undervalued picks based on a set of rules in the prompt.
+   
