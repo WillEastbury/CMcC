@@ -105,6 +105,7 @@ public class AgentChat
         var azureKey = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_KEY");
         var azureDeployment = Environment.GetEnvironmentVariable("AZURE_OPENAI_DEPLOYMENT") ?? "gpt-4o";
 
+        // 1. Azure OpenAI
         if (!string.IsNullOrWhiteSpace(azureEndpoint) && !string.IsNullOrWhiteSpace(azureKey))
         {
             var azureClient = new AzureOpenAIClient(
@@ -113,15 +114,34 @@ public class AgentChat
             return azureClient.GetChatClient(azureDeployment);
         }
 
-        var openAiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY")
-            ?? throw new InvalidOperationException(
-                "No OpenAI credentials found. Set either " +
-                "AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY (for Azure OpenAI) " +
-                "or OPENAI_API_KEY (for OpenAI).");
-
+        var openAiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
         var openAiModel = Environment.GetEnvironmentVariable("OPENAI_MODEL") ?? "gpt-4o";
-        var openAiClient = new OpenAIClient(new ApiKeyCredential(openAiKey));
-        return openAiClient.GetChatClient(openAiModel);
+        var openAiBaseUrl = Environment.GetEnvironmentVariable("OPENAI_BASE_URL");
+
+        // 2. Any OpenAI-compatible endpoint (Ollama, llama.cpp, LM Studio, remote proxies…)
+        //    OPENAI_API_KEY is optional for local servers that don't validate the key.
+        //    ApiKeyCredential requires a non-empty value, so we fall back to "none".
+        //    If your server validates the key, set OPENAI_API_KEY to the expected value.
+        if (!string.IsNullOrWhiteSpace(openAiBaseUrl))
+        {
+            var apiKey = !string.IsNullOrWhiteSpace(openAiKey) ? openAiKey : "none";
+            var options = new OpenAIClientOptions { Endpoint = new Uri(openAiBaseUrl) };
+            var client = new OpenAIClient(new ApiKeyCredential(apiKey), options);
+            return client.GetChatClient(openAiModel);
+        }
+
+        // 3. Standard OpenAI
+        if (!string.IsNullOrWhiteSpace(openAiKey))
+        {
+            var openAiClient = new OpenAIClient(new ApiKeyCredential(openAiKey));
+            return openAiClient.GetChatClient(openAiModel);
+        }
+
+        throw new InvalidOperationException(
+            "No LLM credentials found. Set one of:\n" +
+            "  • AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY  (Azure OpenAI)\n" +
+            "  • OPENAI_BASE_URL [+ OPENAI_API_KEY]            (any OpenAI-compatible endpoint, e.g. Ollama / llama.cpp)\n" +
+            "  • OPENAI_API_KEY                                 (OpenAI)");
     }
 
     // ── System prompt with injected long-term memory ───────────────────────────
